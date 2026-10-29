@@ -1,0 +1,230 @@
+name: APK bauen
+
+# Baut die APK bei jeder Aenderung auf main (oder per Hand: Actions -> APK bauen -> Run workflow).
+# Voraussetzung: Das Secret KEYSTORE_B64 enthaelt denselben Signaturschluessel wie beim Onlineartikel-Archiv.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Abhängigkeiten installieren
+        run: npm install
+
+      - name: Web-Dateien bereitstellen
+        run: |
+          mkdir -p www
+          cp index.html www/index.html
+
+      - name: Android-Projekt erzeugen
+        run: |
+          npx cap add android
+          npx cap sync android
+
+      - name: Internet-Berechtigung sicherstellen
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          if ! grep -q 'android.permission.INTERNET' "$M"; then
+            sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET" />\n    <application#' "$M"
+          fi
+          grep -n 'uses-permission' "$M"
+
+      - name: Eigenes Download-Plugin einsetzen
+        run: |
+          PKG_DIR=android/app/src/main/java/ch/privat/yvesdictionary
+          if [ ! -d "$PKG_DIR" ]; then
+            echo "::error::Paketordner nicht gefunden. Vorhandene Ordner:"
+            find android/app/src/main/java -type d
+            exit 1
+          fi
+          cat > "$PKG_DIR/DownloadsPlugin.java" <<'EOF'
+          package ch.privat.yvesdictionary;
+
+          import android.content.ContentResolver;
+          import android.content.ContentValues;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.io.IOException;
+          import java.io.OutputStream;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          @CapacitorPlugin(name = "Downloads")
+          public class DownloadsPlugin extends Plugin {
+
+              private static final String XLSX_MIME =
+                  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+              @PluginMethod
+              public void saveXlsx(PluginCall call) {
+                  String baseName = call.getString("baseName", "Uebersetzungen");
+                  String data = call.getString("data");
+                  if (data == null || data.isEmpty()) {
+                      call.reject("Keine Daten übergeben");
+                      return;
+                  }
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                      call.reject("Export in den Downloads-Ordner braucht Android 10 oder neuer");
+                      return;
+                  }
+                  try {
+                      byte[] bytes = Base64.decode(data, Base64.DEFAULT);
+                      ContentResolver resolver = getContext().getContentResolver();
+                      Uri collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI;
+
+                      // Höchste vorhandene Nummer suchen: Uebersetzungen_<Zahl>.xlsx
+                      int next = 1;
+                      Pattern pattern = Pattern.compile("^" + Pattern.quote(baseName) + "_(\\d+)\\.xlsx$");
+                      String[] projection = { MediaStore.MediaColumns.DISPLAY_NAME };
+                      String selection = MediaStore.MediaColumns.DISPLAY_NAME + " LIKE ?";
+                      String[] args = { baseName + "%" };
+                      try (Cursor c = resolver.query(collection, projection, selection, args, null)) {
+                          if (c != null) {
+                              while (c.moveToNext()) {
+                                  String existing = c.getString(0);
+                                  if (existing == null) continue;
+                                  Matcher m = pattern.matcher(existing);
+                                  if (m.matches()) {
+                                      try {
+                                          int n = Integer.parseInt(m.group(1));
+                                          if (n >= next) next = n + 1;
+                                      } catch (NumberFormatException ignored) {
+                                          // zu grosse Zahl: überspringen
+                                      }
+                                  }
+                              }
+                          }
+                      }
+
+                      String fileName = baseName + "_" + next + ".xlsx";
+                      ContentValues values = new ContentValues();
+                      values.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
+                      values.put(MediaStore.MediaColumns.MIME_TYPE, XLSX_MIME);
+                      values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                      values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+                      Uri uri = resolver.insert(collection, values);
+                      if (uri == null) {
+                          call.reject("Datei konnte im Ordner Downloads nicht angelegt werden");
+                          return;
+                      }
+                      try (OutputStream out = resolver.openOutputStream(uri)) {
+                          if (out == null) throw new IOException("Ausgabestrom nicht verfügbar");
+                          out.write(bytes);
+                          out.flush();
+                      } catch (Exception e) {
+                          resolver.delete(uri, null, null);
+                          throw e;
+                      }
+                      ContentValues done = new ContentValues();
+                      done.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                      resolver.update(uri, done, null, null);
+
+                      // tatsächlichen Namen zurücklesen (Android kann bei Kollision selbst umbenennen)
+                      String actual = fileName;
+                      try (Cursor c2 = resolver.query(uri, projection, null, null, null)) {
+                          if (c2 != null && c2.moveToFirst() && c2.getString(0) != null) actual = c2.getString(0);
+                      }
+                      JSObject ret = new JSObject();
+                      ret.put("fileName", actual);
+                      ret.put("number", next);
+                      call.resolve(ret);
+                  } catch (Exception e) {
+                      call.reject("Speichern fehlgeschlagen: " + e.getMessage(), e);
+                  }
+              }
+          }
+          EOF
+          cat > "$PKG_DIR/MainActivity.java" <<'EOF'
+          package ch.privat.yvesdictionary;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(DownloadsPlugin.class);
+                  super.onCreate(savedInstanceState);
+              }
+          }
+          EOF
+          echo "Plugin-Dateien geschrieben:"
+          ls -l "$PKG_DIR"
+
+      - name: Festen Signaturschlüssel einsetzen
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::Das Secret KEYSTORE_B64 fehlt. Es muss denselben Schlüssel enthalten wie beim Onlineartikel-Archiv."
+            exit 1
+          fi
+          KS_PATH="$RUNNER_TEMP/fest.keystore"
+          echo "$KEYSTORE_B64" | base64 -d > "$KS_PATH"
+          echo "KS_PATH=$KS_PATH" >> "$GITHUB_ENV"
+          # Gradle ausdrücklich anweisen, diesen Schlüssel für das Debug-Signieren zu verwenden
+          cat >> android/app/build.gradle <<'EOF'
+
+          android {
+              signingConfigs {
+                  debug {
+                      storeFile file(System.getenv("KS_PATH"))
+                      storePassword "android"
+                      keyAlias "androiddebugkey"
+                      keyPassword "android"
+                  }
+              }
+          }
+          EOF
+          echo "Ende von android/app/build.gradle:"
+          tail -n 15 android/app/build.gradle
+
+      - name: Debug-APK bauen
+        working-directory: android
+        run: ./gradlew assembleDebug
+
+      - name: Signatur der APK prüfen
+        run: |
+          APKSIGNER="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner"
+          KS_FP=$(keytool -list -v -keystore "$KS_PATH" -storepass android | grep -m1 'SHA256:' | sed 's/.*SHA256: *//' | tr -d ':' | tr 'A-Z' 'a-z')
+          APK_FP=$("$APKSIGNER" verify --print-certs android/app/build/outputs/apk/debug/app-debug.apk | grep -m1 'SHA-256 digest' | sed 's/.*: *//' | tr -d ' ' | tr 'A-Z' 'a-z')
+          echo "Fingerabdruck des Schlüssels: $KS_FP"
+          echo "Fingerabdruck der APK:        $APK_FP"
+          if [ -z "$KS_FP" ] || [ "$KS_FP" != "$APK_FP" ]; then
+            echo "::error::Die APK ist nicht mit dem festen Schlüssel signiert."
+            exit 1
+          fi
+
+      - name: APK bereitstellen
+        uses: actions/upload-artifact@v7
+        with:
+          name: yves-dictionary-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
