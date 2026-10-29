@@ -66,6 +66,9 @@
   .dialog { background: var(--card); color: var(--fg); border-radius: 16px; padding: 18px; width: 100%; max-width: 420px; }
   .dialog p { margin: 0 0 12px; word-break: break-word; }
   .dialog button { width: 100%; margin-top: 8px; }
+  .dialog { max-height: 92vh; overflow-y: auto; }
+  .dialog textarea { min-height: 3.6em; margin: 4px 0 8px; }
+  .dialog .warnline { background: var(--warn-bg); color: var(--warn-fg); border-radius: 10px; padding: 10px 12px; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -112,6 +115,16 @@
     <button id="askL1" class="primary"></button>
     <button id="askL2" class="primary"></button>
     <button id="askCancel">Abbrechen</button>
+  </div>
+</div>
+
+<div class="overlay" id="review" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="revSrc">
+    <p id="revSrc"></p>
+    <textarea id="revOut" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" aria-label="Übersetzung"></textarea>
+    <p id="revWarn" class="warnline" hidden></p>
+    <button id="revOk" class="primary">Speichern</button>
+    <button id="revCancel">Abbrechen</button>
   </div>
 </div>
 
@@ -382,6 +395,47 @@ function askLanguage(text, l1, l2) {
   });
 }
 
+/* Plausibilitätsprüfung des Vorschlags: nur ein Hinweis, nie eine Sperre */
+async function checkResultLanguage(text, tgt, out) {
+  if (out.trim().toLowerCase() === text.trim().toLowerCase()) {
+    return 'Der Vorschlag ist identisch mit dem Original (bei Namen oder Lehnwörtern kann das stimmen).';
+  }
+  const LI = plugin('LanguageIdentification');
+  if (!LI) return '';
+  try {
+    const r = await LI.identifyPossibleLanguages({ text: out, confidenceThreshold: 0.01 });
+    const top = ((r && r.identifiedLanguages) || []).find(x => String(x.language || '').toLowerCase() !== 'und');
+    if (!top) return '';
+    const code = String(top.language).toLowerCase().split('-')[0];
+    if (code !== tgt && (Number(top.confidence) || 0) >= 0.5) {
+      return 'Achtung: Der Vorschlag sieht nach ' + (NAME[code] || code.toUpperCase()) + ' aus, nicht nach ' + NAME[tgt] + '. Bitte prüfen oder anpassen.';
+    }
+  } catch (e) { console.warn('Prüfung des Vorschlags fehlgeschlagen', e); }
+  return '';
+}
+
+/* Vorschlag anzeigen, Du kannst ihn übernehmen oder ändern; null = abgebrochen */
+function reviewTranslation(text, src, tgt, out, warn) {
+  return new Promise(resolve => {
+    const box = $('review'), field = $('revOut'), ok = $('revOk'), cancel = $('revCancel'), w = $('revWarn');
+    $('revSrc').textContent = '«' + text + '» (' + NAME[src] + ') auf ' + NAME[tgt] + ':';
+    field.value = out;
+    w.textContent = warn || '';
+    w.hidden = !warn;
+    ok.disabled = !out.trim();
+    const done = v => {
+      box.hidden = true;
+      ok.onclick = cancel.onclick = field.oninput = null;
+      resolve(v);
+    };
+    field.oninput = () => { ok.disabled = !field.value.trim(); w.hidden = true; };
+    ok.onclick = () => done(field.value.replace(/\s+/g, ' ').trim());
+    cancel.onclick = () => done(null);
+    box.hidden = false;
+    field.scrollTop = 0;
+  });
+}
+
 /* Spracherkennung: nur zwischen den zwei eingestellten Sprachen */
 async function detectSource(text, l1, l2, askFn) {
   const LI = plugin('LanguageIdentification');
@@ -434,12 +488,15 @@ async function doSave() {
     const res = await plugin('Translation').translate({ text, sourceLanguage: src, targetLanguage: tgt });
     const out = String((res && res.text) || '').trim();
     if (!out) throw new Error('Die Übersetzung war leer');
+    const warn = await checkResultLanguage(text, tgt, out);
+    const finalText = await reviewTranslation(text, src, tgt, out, warn);
+    if (!finalText) { setMsg('Abgebrochen, nichts gespeichert.', 'warn'); return; }
     const entry = { de: '', en: '', fr: '', es: '' };
     entry[src] = text;
-    entry[tgt] = out;
+    entry[tgt] = finalText;
     await DB.add(entry);
     resetInput();
-    setMsg('Gespeichert ✓  ' + text + ' (' + NAME[src] + ') → ' + out + ' (' + NAME[tgt] + ')', 'ok');
+    setMsg('Gespeichert ✓  ' + text + ' (' + NAME[src] + ') → ' + finalText + ' (' + NAME[tgt] + ')', 'ok');
     await renderCount();
   } catch (e) {
     setMsg('Nicht gespeichert: ' + errText(e), 'err');
